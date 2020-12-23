@@ -13,6 +13,19 @@ import (
 	a "golang.org/x/net/html/atom"
 )
 
+// CustomElement describes an element not defined by the HTML standard.
+// It defines how the parser should process it.
+type CustomElement struct {
+	// Name of the element without enclosing chevrons, e.g. "foo" for elm <foo>
+	Name string
+	// Whether foster parenting rules should be applied to this element.
+	// If true, the element will be created exactly where it occurs.
+	// If false, foster parenting rules will be applied depending on ProcessLike.
+	DisableFosterParenting bool
+	// Reference element whose behavior should be applied to this element.
+	ProcessLike a.Atom
+}
+
 // A parser implements the HTML5 parsing algorithm:
 // https://html.spec.whatwg.org/multipage/syntax.html#tree-construction
 type parser struct {
@@ -20,6 +33,11 @@ type parser struct {
 	tokenizer *Tokenizer
 	// tok is the most recently read token.
 	tok Token
+	// elm is the element the current token is to be processed as.
+	// it is identical to tok.DataAtom unless the token is a non-standard element
+	// in which case this is 0 for unknown elements or the user-registered
+	// CustomElement's ProcessLike value.
+	elm a.Atom
 	// Self-closing tags like <hr/> are treated as start tags, except that
 	// hasSelfClosingToken is set while they are being processed.
 	hasSelfClosingToken bool
@@ -42,6 +60,9 @@ type parser struct {
 	// fosterParenting is whether new elements should be inserted according to
 	// the foster parenting rules (section 12.2.6.1).
 	fosterParenting bool
+	// disableFosterParenting overrides fosterParenting for custom elements that
+	// have DisableFosterParenting set.
+	disableFosterParenting bool
 	// quirks is whether the parser is operating in "quirks mode."
 	quirks bool
 	// fragment is whether the parser is parsing an HTML fragment.
@@ -49,6 +70,9 @@ type parser struct {
 	// context is the context element when parsing an HTML fragment
 	// (section 12.4).
 	context *Node
+	// customElements contains an optional list of user-registered non-standard
+	// elements, describing their behavior.
+	customElements []CustomElement
 }
 
 func (p *parser) top() *Node {
@@ -104,12 +128,24 @@ func (p *parser) popUntil(s scope, matchTags ...a.Atom) bool {
 	return false
 }
 
+func (p *parser) elmFrom(n *Node) a.Atom {
+	if n.DataAtom != 0 {
+		return n.DataAtom
+	}
+	for _, elm := range p.customElements {
+		if elm.Name == n.Data {
+			return elm.ProcessLike
+		}
+	}
+	return 0
+}
+
 // indexOfElementInScope returns the index in p.oe of the highest element whose
 // tag is in matchTags that is in scope. If no matching element is in scope, it
 // returns -1.
 func (p *parser) indexOfElementInScope(s scope, matchTags ...a.Atom) int {
 	for i := len(p.oe) - 1; i >= 0; i-- {
-		tagAtom := p.oe[i].DataAtom
+		tagAtom := p.elmFrom(p.oe[i])
 		if p.oe[i].Namespace == "" {
 			for _, t := range matchTags {
 				if t == tagAtom {
@@ -157,11 +193,26 @@ func (p *parser) elementInScope(s scope, matchTags ...a.Atom) bool {
 	return p.indexOfElementInScope(s, matchTags...) != -1
 }
 
+func (p *parser) oeContains(atom a.Atom) bool {
+	for _, n := range p.oe {
+		if n.DataAtom == atom && n.Namespace == "" {
+			return true
+		} else if n.DataAtom == 0 {
+			for _, elm := range p.customElements {
+				if elm.ProcessLike == atom && n.Data == elm.Name {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // clearStackToContext pops elements off the stack of open elements until a
 // scope-defined element is found.
 func (p *parser) clearStackToContext(s scope) {
 	for i := len(p.oe) - 1; i >= 0; i-- {
-		tagAtom := p.oe[i].DataAtom
+		tagAtom := p.elmFrom(p.oe[i])
 		switch s {
 		case tableScope:
 			if tagAtom == a.Html || tagAtom == a.Table || tagAtom == a.Template {
@@ -206,7 +257,7 @@ loop:
 		if n.Type != ElementNode {
 			break
 		}
-		switch n.DataAtom {
+		switch p.elmFrom(n) {
 		case a.Dd, a.Dt, a.Li, a.Optgroup, a.Option, a.P, a.Rb, a.Rp, a.Rt, a.Rtc:
 			for _, except := range exceptions {
 				if n.Data == except {
@@ -239,7 +290,7 @@ func (p *parser) addChild(n *Node) {
 // foster parented.
 func (p *parser) shouldFosterParent() bool {
 	if p.fosterParenting {
-		switch p.top().DataAtom {
+		switch p.elmFrom(p.top()) {
 		case a.Table, a.Tbody, a.Tfoot, a.Thead, a.Tr:
 			return true
 		}
@@ -253,7 +304,7 @@ func (p *parser) fosterParent(n *Node) {
 	var table, parent, prev, template *Node
 	var i int
 	for i = len(p.oe) - 1; i >= 0; i-- {
-		if p.oe[i].DataAtom == a.Table {
+		if p.elmFrom(p.oe[i]) == a.Table {
 			table = p.oe[i]
 			break
 		}
@@ -261,7 +312,7 @@ func (p *parser) fosterParent(n *Node) {
 
 	var j int
 	for j = len(p.oe) - 1; j >= 0; j-- {
-		if p.oe[j].DataAtom == a.Template {
+		if p.elmFrom(p.oe[j]) == a.Template {
 			template = p.oe[j]
 			break
 		}
@@ -333,7 +384,7 @@ func (p *parser) addElement() {
 
 // Section 12.2.4.3.
 func (p *parser) addFormattingElement() {
-	tagAtom, attr := p.tok.DataAtom, p.tok.Attr
+	tagAtom, attr := p.elm, p.tok.Attr
 	p.addElement()
 
 	// Implement the Noah's Ark clause, but with three per family instead of two.
@@ -350,7 +401,7 @@ findIdenticalElements:
 		if n.Namespace != "" {
 			continue
 		}
-		if n.DataAtom != tagAtom {
+		if p.elmFrom(n) != tagAtom {
 			continue
 		}
 		if len(n.Attr) != len(attr) {
@@ -446,12 +497,12 @@ func (p *parser) resetInsertionMode() {
 			n = p.context
 		}
 
-		switch n.DataAtom {
+		switch p.elmFrom(n) {
 		case a.Select:
 			if !last {
 				for ancestor, first := n, p.oe[0]; ancestor != first; {
 					ancestor = p.oe[p.oe.index(ancestor)-1]
-					switch ancestor.DataAtom {
+					switch p.elmFrom(ancestor) {
 					case a.Template:
 						p.im = inSelectIM
 						return
@@ -551,13 +602,13 @@ func beforeHTMLIM(p *parser) bool {
 			return true
 		}
 	case StartTagToken:
-		if p.tok.DataAtom == a.Html {
+		if p.elm == a.Html {
 			p.addElement()
 			p.im = beforeHeadIM
 			return true
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Head, a.Body, a.Html, a.Br:
 			p.parseImpliedToken(StartTagToken, a.Html, a.Html.String())
 			return false
@@ -586,7 +637,7 @@ func beforeHeadIM(p *parser) bool {
 			return true
 		}
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Head:
 			p.addElement()
 			p.head = p.top()
@@ -596,7 +647,7 @@ func beforeHeadIM(p *parser) bool {
 			return inBodyIM(p)
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Head, a.Body, a.Html, a.Br:
 			p.parseImpliedToken(StartTagToken, a.Head, a.Head.String())
 			return false
@@ -633,7 +684,7 @@ func inHeadIM(p *parser) bool {
 			p.tok.Data = s
 		}
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Html:
 			return inBodyIM(p)
 		case a.Base, a.Basefont, a.Bgsound, a.Link, a.Meta:
@@ -671,7 +722,7 @@ func inHeadIM(p *parser) bool {
 			return true
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Head:
 			p.oe.pop()
 			p.im = afterHeadIM
@@ -680,7 +731,7 @@ func inHeadIM(p *parser) bool {
 			p.parseImpliedToken(EndTagToken, a.Head, a.Head.String())
 			return false
 		case a.Template:
-			if !p.oe.contains(a.Template) {
+			if !p.oeContains(a.Template) {
 				return true
 			}
 			// TODO: remove this divergence from the HTML5 spec.
@@ -688,7 +739,7 @@ func inHeadIM(p *parser) bool {
 			// See https://bugs.chromium.org/p/chromium/issues/detail?id=829668
 			p.generateImpliedEndTags()
 			for i := len(p.oe) - 1; i >= 0; i-- {
-				if n := p.oe[i]; n.Namespace == "" && n.DataAtom == a.Template {
+				if n := p.oe[i]; n.Namespace == "" && p.elmFrom(n) == a.Template {
 					p.oe = p.oe[:i]
 					break
 				}
@@ -723,7 +774,7 @@ func inHeadNoscriptIM(p *parser) bool {
 		// Ignore the token.
 		return true
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Html:
 			return inBodyIM(p)
 		case a.Basefont, a.Bgsound, a.Link, a.Meta, a.Noframes, a.Style:
@@ -739,7 +790,7 @@ func inHeadNoscriptIM(p *parser) bool {
 			return true
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Noscript, a.Br:
 		default:
 			// Ignore the token.
@@ -755,11 +806,11 @@ func inHeadNoscriptIM(p *parser) bool {
 		return inHeadIM(p)
 	}
 	p.oe.pop()
-	if p.top().DataAtom != a.Head {
+	if p.elmFrom(p.top()) != a.Head {
 		panic("html: the new current node will be a head element.")
 	}
 	p.im = inHeadIM
-	if p.tok.DataAtom == a.Noscript {
+	if p.elm == a.Noscript {
 		return true
 	}
 	return false
@@ -779,7 +830,7 @@ func afterHeadIM(p *parser) bool {
 			p.tok.Data = s
 		}
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Html:
 			return inBodyIM(p)
 		case a.Body:
@@ -800,7 +851,7 @@ func afterHeadIM(p *parser) bool {
 			return true
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Body, a.Html, a.Br:
 			// Drop down to creating an implied <body> tag.
 		case a.Template:
@@ -847,7 +898,7 @@ func inBodyIM(p *parser) bool {
 	switch p.tok.Type {
 	case TextToken:
 		d := p.tok.Data
-		switch n := p.oe.top(); n.DataAtom {
+		switch n := p.oe.top(); p.elmFrom(n) {
 		case a.Pre, a.Listing:
 			if n.FirstChild == nil {
 				// Ignore a newline at the start of a <pre> block.
@@ -870,27 +921,27 @@ func inBodyIM(p *parser) bool {
 			p.framesetOK = false
 		}
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Html:
-			if p.oe.contains(a.Template) {
+			if p.oeContains(a.Template) {
 				return true
 			}
 			copyAttributes(p.oe[0], p.tok)
 		case a.Base, a.Basefont, a.Bgsound, a.Link, a.Meta, a.Noframes, a.Script, a.Style, a.Template, a.Title:
 			return inHeadIM(p)
 		case a.Body:
-			if p.oe.contains(a.Template) {
+			if p.oeContains(a.Template) {
 				return true
 			}
 			if len(p.oe) >= 2 {
 				body := p.oe[1]
-				if body.Type == ElementNode && body.DataAtom == a.Body {
+				if body.Type == ElementNode && p.elmFrom(body) == a.Body {
 					p.framesetOK = false
 					copyAttributes(body, p.tok)
 				}
 			}
 		case a.Frameset:
-			if !p.framesetOK || len(p.oe) < 2 || p.oe[1].DataAtom != a.Body {
+			if !p.framesetOK || len(p.oe) < 2 || p.elmFrom(p.oe[1]) != a.Body {
 				// Ignore the token.
 				return true
 			}
@@ -907,7 +958,7 @@ func inBodyIM(p *parser) bool {
 			p.addElement()
 		case a.H1, a.H2, a.H3, a.H4, a.H5, a.H6:
 			p.popUntil(buttonScope, a.P)
-			switch n := p.top(); n.DataAtom {
+			switch n := p.top(); p.elmFrom(n) {
 			case a.H1, a.H2, a.H3, a.H4, a.H5, a.H6:
 				p.oe.pop()
 			}
@@ -918,20 +969,20 @@ func inBodyIM(p *parser) bool {
 			// The newline, if any, will be dealt with by the TextToken case.
 			p.framesetOK = false
 		case a.Form:
-			if p.form != nil && !p.oe.contains(a.Template) {
+			if p.form != nil && !p.oeContains(a.Template) {
 				// Ignore the token
 				return true
 			}
 			p.popUntil(buttonScope, a.P)
 			p.addElement()
-			if !p.oe.contains(a.Template) {
+			if !p.oeContains(a.Template) {
 				p.form = p.top()
 			}
 		case a.Li:
 			p.framesetOK = false
 			for i := len(p.oe) - 1; i >= 0; i-- {
 				node := p.oe[i]
-				switch node.DataAtom {
+				switch p.elmFrom(node) {
 				case a.Li:
 					p.oe = p.oe[:i]
 				case a.Address, a.Div, a.P:
@@ -949,7 +1000,7 @@ func inBodyIM(p *parser) bool {
 			p.framesetOK = false
 			for i := len(p.oe) - 1; i >= 0; i-- {
 				node := p.oe[i]
-				switch node.DataAtom {
+				switch p.elmFrom(node) {
 				case a.Dd, a.Dt:
 					p.oe = p.oe[:i]
 				case a.Address, a.Div, a.P:
@@ -973,7 +1024,7 @@ func inBodyIM(p *parser) bool {
 			p.framesetOK = false
 		case a.A:
 			for i := len(p.afe) - 1; i >= 0 && p.afe[i].Type != scopeMarkerNode; i-- {
-				if n := p.afe[i]; n.Type == ElementNode && n.DataAtom == a.A {
+				if n := p.afe[i]; n.Type == ElementNode && p.elmFrom(n) == a.A {
 					p.inBodyEndTagFormatting(a.A, "a")
 					p.oe.remove(n)
 					p.afe.remove(n)
@@ -1010,7 +1061,7 @@ func inBodyIM(p *parser) bool {
 			p.addElement()
 			p.oe.pop()
 			p.acknowledgeSelfClosingTag()
-			if p.tok.DataAtom == a.Input {
+			if p.elm == a.Input {
 				for _, t := range p.tok.Attr {
 					if t.Key == "type" {
 						if strings.ToLower(t.Val) == "hidden" {
@@ -1033,6 +1084,7 @@ func inBodyIM(p *parser) bool {
 			p.framesetOK = false
 		case a.Image:
 			p.tok.DataAtom = a.Img
+			p.elm = a.Img
 			p.tok.Data = a.Img.String()
 			return false
 		case a.Textarea:
@@ -1066,7 +1118,7 @@ func inBodyIM(p *parser) bool {
 			p.im = inSelectIM
 			return true
 		case a.Optgroup, a.Option:
-			if p.top().DataAtom == a.Option {
+			if p.elmFrom(p.top()) == a.Option {
 				p.oe.pop()
 			}
 			p.reconstructActiveFormattingElements()
@@ -1083,7 +1135,7 @@ func inBodyIM(p *parser) bool {
 			p.addElement()
 		case a.Math, a.Svg:
 			p.reconstructActiveFormattingElements()
-			if p.tok.DataAtom == a.Math {
+			if p.elm == a.Math {
 				adjustAttributeNames(p.tok.Attr, mathMLAttributeAdjustments)
 			} else {
 				adjustAttributeNames(p.tok.Attr, svgAttributeAdjustments)
@@ -1103,7 +1155,7 @@ func inBodyIM(p *parser) bool {
 			p.addElement()
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Body:
 			if p.elementInScope(defaultScope, a.Body) {
 				p.im = afterBodyIM
@@ -1115,16 +1167,16 @@ func inBodyIM(p *parser) bool {
 			}
 			return true
 		case a.Address, a.Article, a.Aside, a.Blockquote, a.Button, a.Center, a.Details, a.Dialog, a.Dir, a.Div, a.Dl, a.Fieldset, a.Figcaption, a.Figure, a.Footer, a.Header, a.Hgroup, a.Listing, a.Main, a.Menu, a.Nav, a.Ol, a.Pre, a.Section, a.Summary, a.Ul:
-			p.popUntil(defaultScope, p.tok.DataAtom)
+			p.popUntil(defaultScope, p.elm)
 		case a.Form:
-			if p.oe.contains(a.Template) {
+			if p.oeContains(a.Template) {
 				i := p.indexOfElementInScope(defaultScope, a.Form)
 				if i == -1 {
 					// Ignore the token.
 					return true
 				}
 				p.generateImpliedEndTags()
-				if p.oe[i].DataAtom != a.Form {
+				if p.elmFrom(p.oe[i]) != a.Form {
 					// Ignore the token.
 					return true
 				}
@@ -1148,13 +1200,13 @@ func inBodyIM(p *parser) bool {
 		case a.Li:
 			p.popUntil(listItemScope, a.Li)
 		case a.Dd, a.Dt:
-			p.popUntil(defaultScope, p.tok.DataAtom)
+			p.popUntil(defaultScope, p.elm)
 		case a.H1, a.H2, a.H3, a.H4, a.H5, a.H6:
 			p.popUntil(defaultScope, a.H1, a.H2, a.H3, a.H4, a.H5, a.H6)
 		case a.A, a.B, a.Big, a.Code, a.Em, a.Font, a.I, a.Nobr, a.S, a.Small, a.Strike, a.Strong, a.Tt, a.U:
-			p.inBodyEndTagFormatting(p.tok.DataAtom, p.tok.Data)
+			p.inBodyEndTagFormatting(p.elm, p.tok.Data)
 		case a.Applet, a.Marquee, a.Object:
-			if p.popUntil(defaultScope, p.tok.DataAtom) {
+			if p.popUntil(defaultScope, p.elm) {
 				p.clearActiveFormattingElements()
 			}
 		case a.Br:
@@ -1163,7 +1215,7 @@ func inBodyIM(p *parser) bool {
 		case a.Template:
 			return inHeadIM(p)
 		default:
-			p.inBodyEndTagOther(p.tok.DataAtom, p.tok.Data)
+			p.inBodyEndTagOther(p.elm, p.tok.Data)
 		}
 	case CommentToken:
 		p.addChild(&Node{
@@ -1177,7 +1229,7 @@ func inBodyIM(p *parser) bool {
 			return false
 		}
 		for _, e := range p.oe {
-			switch e.DataAtom {
+			switch p.elmFrom(e) {
 			case a.Dd, a.Dt, a.Li, a.Optgroup, a.Option, a.P, a.Rb, a.Rp, a.Rt, a.Rtc, a.Tbody, a.Td, a.Tfoot, a.Th,
 				a.Thead, a.Tr, a.Body, a.Html:
 			default:
@@ -1211,7 +1263,7 @@ func (p *parser) inBodyEndTagFormatting(tagAtom a.Atom, tagName string) {
 			if p.afe[j].Type == scopeMarkerNode {
 				break
 			}
-			if p.afe[j].DataAtom == tagAtom {
+			if p.elmFrom(p.afe[j]) == tagAtom {
 				formattingElement = p.afe[j]
 				break
 			}
@@ -1315,7 +1367,7 @@ func (p *parser) inBodyEndTagFormatting(tagAtom a.Atom, tagName string) {
 		if lastNode.Parent != nil {
 			lastNode.Parent.RemoveChild(lastNode)
 		}
-		switch commonAncestor.DataAtom {
+		switch p.elmFrom(commonAncestor) {
 		case a.Table, a.Tbody, a.Tfoot, a.Thead, a.Tr:
 			p.fosterParent(lastNode)
 		default:
@@ -1354,7 +1406,7 @@ func (p *parser) inBodyEndTagOther(tagAtom a.Atom, tagName string) {
 		// Uncommon (custom) tags get a zero DataAtom.
 		//
 		// The if condition here is equivalent to (p.oe[i].Data == tagName).
-		if (p.oe[i].DataAtom == tagAtom) &&
+		if (p.elmFrom(p.oe[i]) == tagAtom) &&
 			((tagAtom != 0) || (p.oe[i].Data == tagName)) {
 			p.oe = p.oe[:i]
 			break
@@ -1372,7 +1424,7 @@ func textIM(p *parser) bool {
 		p.oe.pop()
 	case TextToken:
 		d := p.tok.Data
-		if n := p.oe.top(); n.DataAtom == a.Textarea && n.FirstChild == nil {
+		if n := p.oe.top(); p.elmFrom(n) == a.Textarea && n.FirstChild == nil {
 			// Ignore a newline at the start of a <textarea> block.
 			if d != "" && d[0] == '\r' {
 				d = d[1:]
@@ -1399,7 +1451,7 @@ func inTableIM(p *parser) bool {
 	switch p.tok.Type {
 	case TextToken:
 		p.tok.Data = strings.Replace(p.tok.Data, "\x00", "", -1)
-		switch p.oe.top().DataAtom {
+		switch p.elmFrom(p.oe.top()) {
 		case a.Table, a.Tbody, a.Tfoot, a.Thead, a.Tr:
 			if strings.Trim(p.tok.Data, whitespace) == "" {
 				p.addText(p.tok.Data)
@@ -1407,7 +1459,7 @@ func inTableIM(p *parser) bool {
 			}
 		}
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Caption:
 			p.clearStackToContext(tableScope)
 			p.afe = append(p.afe, &scopeMarker)
@@ -1449,7 +1501,7 @@ func inTableIM(p *parser) bool {
 			}
 			// Otherwise drop down to the default action.
 		case a.Form:
-			if p.oe.contains(a.Template) || p.form != nil {
+			if p.oeContains(a.Template) || p.form != nil {
 				// Ignore the token.
 				return true
 			}
@@ -1457,7 +1509,7 @@ func inTableIM(p *parser) bool {
 			p.form = p.oe.pop()
 		case a.Select:
 			p.reconstructActiveFormattingElements()
-			switch p.top().DataAtom {
+			switch p.elmFrom(p.top()) {
 			case a.Table, a.Tbody, a.Tfoot, a.Thead, a.Tr:
 				p.fosterParenting = true
 			}
@@ -1468,7 +1520,7 @@ func inTableIM(p *parser) bool {
 			return true
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Table:
 			if p.popUntil(tableScope, a.Table) {
 				p.resetInsertionMode()
@@ -1495,7 +1547,7 @@ func inTableIM(p *parser) bool {
 		return inBodyIM(p)
 	}
 
-	p.fosterParenting = true
+	p.fosterParenting = !p.disableFosterParenting
 	defer func() { p.fosterParenting = false }()
 
 	return inBodyIM(p)
@@ -1505,7 +1557,7 @@ func inTableIM(p *parser) bool {
 func inCaptionIM(p *parser) bool {
 	switch p.tok.Type {
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Caption, a.Col, a.Colgroup, a.Tbody, a.Td, a.Tfoot, a.Thead, a.Tr:
 			if !p.popUntil(tableScope, a.Caption) {
 				// Ignore the token.
@@ -1522,7 +1574,7 @@ func inCaptionIM(p *parser) bool {
 			return true
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Caption:
 			if p.popUntil(tableScope, a.Caption) {
 				p.clearActiveFormattingElements()
@@ -1568,7 +1620,7 @@ func inColumnGroupIM(p *parser) bool {
 		// Ignore the token.
 		return true
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Html:
 			return inBodyIM(p)
 		case a.Col:
@@ -1580,9 +1632,9 @@ func inColumnGroupIM(p *parser) bool {
 			return inHeadIM(p)
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Colgroup:
-			if p.oe.top().DataAtom == a.Colgroup {
+			if p.elmFrom(p.oe.top()) == a.Colgroup {
 				p.oe.pop()
 				p.im = inTableIM
 			}
@@ -1596,7 +1648,7 @@ func inColumnGroupIM(p *parser) bool {
 	case ErrorToken:
 		return inBodyIM(p)
 	}
-	if p.oe.top().DataAtom != a.Colgroup {
+	if p.elmFrom(p.oe.top()) != a.Colgroup {
 		return true
 	}
 	p.oe.pop()
@@ -1608,7 +1660,7 @@ func inColumnGroupIM(p *parser) bool {
 func inTableBodyIM(p *parser) bool {
 	switch p.tok.Type {
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Tr:
 			p.clearStackToContext(tableBodyScope)
 			p.addElement()
@@ -1626,9 +1678,9 @@ func inTableBodyIM(p *parser) bool {
 			return true
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Tbody, a.Tfoot, a.Thead:
-			if p.elementInScope(tableScope, p.tok.DataAtom) {
+			if p.elementInScope(tableScope, p.elm) {
 				p.clearStackToContext(tableBodyScope)
 				p.oe.pop()
 				p.im = inTableIM
@@ -1660,7 +1712,7 @@ func inTableBodyIM(p *parser) bool {
 func inRowIM(p *parser) bool {
 	switch p.tok.Type {
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Td, a.Th:
 			p.clearStackToContext(tableRowScope)
 			p.addElement()
@@ -1676,7 +1728,7 @@ func inRowIM(p *parser) bool {
 			return true
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Tr:
 			if p.popUntil(tableScope, a.Tr) {
 				p.im = inTableBodyIM
@@ -1692,7 +1744,7 @@ func inRowIM(p *parser) bool {
 			// Ignore the token.
 			return true
 		case a.Tbody, a.Tfoot, a.Thead:
-			if p.elementInScope(tableScope, p.tok.DataAtom) {
+			if p.elementInScope(tableScope, p.elm) {
 				p.parseImpliedToken(EndTagToken, a.Tr, a.Tr.String())
 				return false
 			}
@@ -1711,7 +1763,7 @@ func inRowIM(p *parser) bool {
 func inCellIM(p *parser) bool {
 	switch p.tok.Type {
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Caption, a.Col, a.Colgroup, a.Tbody, a.Td, a.Tfoot, a.Th, a.Thead, a.Tr:
 			if p.popUntil(tableScope, a.Td, a.Th) {
 				// Close the cell and reprocess.
@@ -1729,9 +1781,9 @@ func inCellIM(p *parser) bool {
 			return true
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Td, a.Th:
-			if !p.popUntil(tableScope, p.tok.DataAtom) {
+			if !p.popUntil(tableScope, p.elm) {
 				// Ignore the token.
 				return true
 			}
@@ -1742,7 +1794,7 @@ func inCellIM(p *parser) bool {
 			// Ignore the token.
 			return true
 		case a.Table, a.Tbody, a.Tfoot, a.Thead, a.Tr:
-			if !p.elementInScope(tableScope, p.tok.DataAtom) {
+			if !p.elementInScope(tableScope, p.elm) {
 				// Ignore the token.
 				return true
 			}
@@ -1763,19 +1815,19 @@ func inSelectIM(p *parser) bool {
 	case TextToken:
 		p.addText(strings.Replace(p.tok.Data, "\x00", "", -1))
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Html:
 			return inBodyIM(p)
 		case a.Option:
-			if p.top().DataAtom == a.Option {
+			if p.elmFrom(p.top()) == a.Option {
 				p.oe.pop()
 			}
 			p.addElement()
 		case a.Optgroup:
-			if p.top().DataAtom == a.Option {
+			if p.elmFrom(p.top()) == a.Option {
 				p.oe.pop()
 			}
-			if p.top().DataAtom == a.Optgroup {
+			if p.elmFrom(p.top()) == a.Optgroup {
 				p.oe.pop()
 			}
 			p.addElement()
@@ -1805,17 +1857,17 @@ func inSelectIM(p *parser) bool {
 			return true
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Option:
-			if p.top().DataAtom == a.Option {
+			if p.elmFrom(p.top()) == a.Option {
 				p.oe.pop()
 			}
 		case a.Optgroup:
 			i := len(p.oe) - 1
-			if p.oe[i].DataAtom == a.Option {
+			if p.elmFrom(p.oe[i]) == a.Option {
 				i--
 			}
-			if p.oe[i].DataAtom == a.Optgroup {
+			if p.elmFrom(p.oe[i]) == a.Optgroup {
 				p.oe = p.oe[:i]
 			}
 		case a.Select:
@@ -1846,9 +1898,9 @@ func inSelectIM(p *parser) bool {
 func inSelectInTableIM(p *parser) bool {
 	switch p.tok.Type {
 	case StartTagToken, EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Caption, a.Table, a.Tbody, a.Tfoot, a.Thead, a.Tr, a.Td, a.Th:
-			if p.tok.Type == EndTagToken && !p.elementInScope(tableScope, p.tok.DataAtom) {
+			if p.tok.Type == EndTagToken && !p.elementInScope(tableScope, p.elm) {
 				// Ignore the token.
 				return true
 			}
@@ -1857,7 +1909,7 @@ func inSelectInTableIM(p *parser) bool {
 			// tag is arguably incorrect (conceptually), but it mimics what
 			// Chromium does.
 			for i := len(p.oe) - 1; i >= 0; i-- {
-				if n := p.oe[i]; n.DataAtom == a.Select {
+				if n := p.oe[i]; p.elmFrom(n) == a.Select {
 					p.oe = p.oe[:i]
 					break
 				}
@@ -1875,7 +1927,7 @@ func inTemplateIM(p *parser) bool {
 	case TextToken, CommentToken, DoctypeToken:
 		return inBodyIM(p)
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Base, a.Basefont, a.Bgsound, a.Link, a.Meta, a.Noframes, a.Script, a.Style, a.Template, a.Title:
 			return inHeadIM(p)
 		case a.Caption, a.Colgroup, a.Tbody, a.Tfoot, a.Thead:
@@ -1905,7 +1957,7 @@ func inTemplateIM(p *parser) bool {
 			return false
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Template:
 			return inHeadIM(p)
 		default:
@@ -1913,7 +1965,7 @@ func inTemplateIM(p *parser) bool {
 			return true
 		}
 	case ErrorToken:
-		if !p.oe.contains(a.Template) {
+		if !p.oeContains(a.Template) {
 			// Ignore the token.
 			return true
 		}
@@ -1922,7 +1974,7 @@ func inTemplateIM(p *parser) bool {
 		// See https://bugs.chromium.org/p/chromium/issues/detail?id=829668
 		p.generateImpliedEndTags()
 		for i := len(p.oe) - 1; i >= 0; i-- {
-			if n := p.oe[i]; n.Namespace == "" && n.DataAtom == a.Template {
+			if n := p.oe[i]; n.Namespace == "" && p.elmFrom(n) == a.Template {
 				p.oe = p.oe[:i]
 				break
 			}
@@ -1948,11 +2000,11 @@ func afterBodyIM(p *parser) bool {
 			return inBodyIM(p)
 		}
 	case StartTagToken:
-		if p.tok.DataAtom == a.Html {
+		if p.elm == a.Html {
 			return inBodyIM(p)
 		}
 	case EndTagToken:
-		if p.tok.DataAtom == a.Html {
+		if p.elm == a.Html {
 			if !p.fragment {
 				p.im = afterAfterBodyIM
 			}
@@ -1960,7 +2012,7 @@ func afterBodyIM(p *parser) bool {
 		}
 	case CommentToken:
 		// The comment is attached to the <html> element.
-		if len(p.oe) < 1 || p.oe[0].DataAtom != a.Html {
+		if len(p.oe) < 1 || p.elmFrom(p.oe[0]) != a.Html {
 			panic("html: bad parser state: <html> element not found, in the after-body insertion mode")
 		}
 		p.oe[0].AppendChild(&Node{
@@ -1994,7 +2046,7 @@ func inFramesetIM(p *parser) bool {
 			p.addText(s)
 		}
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Html:
 			return inBodyIM(p)
 		case a.Frameset:
@@ -2007,11 +2059,11 @@ func inFramesetIM(p *parser) bool {
 			return inHeadIM(p)
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Frameset:
-			if p.oe.top().DataAtom != a.Html {
+			if p.elmFrom(p.oe.top()) != a.Html {
 				p.oe.pop()
-				if p.oe.top().DataAtom != a.Frameset {
+				if p.elmFrom(p.oe.top()) != a.Frameset {
 					p.im = afterFramesetIM
 					return true
 				}
@@ -2044,14 +2096,14 @@ func afterFramesetIM(p *parser) bool {
 			p.addText(s)
 		}
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Html:
 			return inBodyIM(p)
 		case a.Noframes:
 			return inHeadIM(p)
 		}
 	case EndTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Html:
 			p.im = afterAfterFramesetIM
 			return true
@@ -2075,7 +2127,7 @@ func afterAfterBodyIM(p *parser) bool {
 			return inBodyIM(p)
 		}
 	case StartTagToken:
-		if p.tok.DataAtom == a.Html {
+		if p.elm == a.Html {
 			return inBodyIM(p)
 		}
 	case CommentToken:
@@ -2113,7 +2165,7 @@ func afterAfterFramesetIM(p *parser) bool {
 			return inBodyIM(p)
 		}
 	case StartTagToken:
-		switch p.tok.DataAtom {
+		switch p.elm {
 		case a.Html:
 			return inBodyIM(p)
 		case a.Noframes:
@@ -2146,7 +2198,7 @@ func parseForeignContent(p *parser) bool {
 	case StartTagToken:
 		if !p.fragment {
 			b := breakout[p.tok.Data]
-			if p.tok.DataAtom == a.Font {
+			if p.elm == a.Font {
 			loop:
 				for _, attr := range p.tok.Attr {
 					switch attr.Key {
@@ -2176,6 +2228,7 @@ func parseForeignContent(p *parser) bool {
 			// SVG wants e.g. "foreignObject" with a capital second "O".
 			if x := svgTagNameAdjustments[p.tok.Data]; x != "" {
 				p.tok.DataAtom = a.Lookup([]byte(x))
+				p.elm = p.tok.DataAtom
 				p.tok.Data = x
 			}
 			adjustAttributeNames(p.tok.Attr, svgAttributeAdjustments)
@@ -2230,14 +2283,14 @@ func (p *parser) inForeignContent() bool {
 		return false
 	}
 	if mathMLTextIntegrationPoint(n) {
-		if p.tok.Type == StartTagToken && p.tok.DataAtom != a.Mglyph && p.tok.DataAtom != a.Malignmark {
+		if p.tok.Type == StartTagToken && p.elm != a.Mglyph && p.elm != a.Malignmark {
 			return false
 		}
 		if p.tok.Type == TextToken {
 			return false
 		}
 	}
-	if n.Namespace == "math" && n.DataAtom == a.AnnotationXml && p.tok.Type == StartTagToken && p.tok.DataAtom == a.Svg {
+	if n.Namespace == "math" && p.elmFrom(n) == a.AnnotationXml && p.tok.Type == StartTagToken && p.elm == a.Svg {
 		return false
 	}
 	if htmlIntegrationPoint(n) && (p.tok.Type == StartTagToken || p.tok.Type == TextToken) {
@@ -2252,15 +2305,16 @@ func (p *parser) inForeignContent() bool {
 // parseImpliedToken parses a token as though it had appeared in the parser's
 // input.
 func (p *parser) parseImpliedToken(t TokenType, dataAtom a.Atom, data string) {
-	realToken, selfClosing := p.tok, p.hasSelfClosingToken
+	realToken, realElm, selfClosing := p.tok, p.elm, p.hasSelfClosingToken
 	p.tok = Token{
 		Type:     t,
 		DataAtom: dataAtom,
 		Data:     data,
 	}
+	p.elm = dataAtom
 	p.hasSelfClosingToken = false
 	p.parseCurrentToken()
-	p.tok, p.hasSelfClosingToken = realToken, selfClosing
+	p.tok, p.elm, p.hasSelfClosingToken = realToken, realElm, selfClosing
 }
 
 // parseCurrentToken runs the current token through the parsing routines
@@ -2289,6 +2343,7 @@ func (p *parser) parseCurrentToken() {
 func (p *parser) parse() error {
 	// Iterate until EOF. Any other error will cause an early return.
 	var err error
+OUTER:
 	for err != io.EOF {
 		// CDATA sections are allowed only in foreign content.
 		n := p.oe.top()
@@ -2296,12 +2351,28 @@ func (p *parser) parse() error {
 		// Read and parse the next token.
 		p.tokenizer.Next()
 		p.tok = p.tokenizer.Token()
-		if p.tok.Type == ErrorToken {
+		switch p.tok.Type {
+		case ErrorToken:
 			err = p.tokenizer.Err()
 			if err != nil && err != io.EOF {
 				return err
 			}
+		case StartTagToken, EndTagToken, SelfClosingTagToken:
+			if p.tok.DataAtom == 0 {
+				for _, elm := range p.customElements {
+					if elm.Name == p.tok.Data {
+						p.disableFosterParenting = elm.DisableFosterParenting
+						p.elm = elm.ProcessLike
+						fmt.Printf("custom element: <%v>, treat as <%v>\n", p.tok.Data, p.elm.String())
+						p.parseCurrentToken()
+						p.disableFosterParenting = false
+						continue OUTER
+					}
+				}
+				fmt.Printf("Unknown token: <%s>\n", p.tok.Data)
+			}
 		}
+		p.elm = p.tok.DataAtom
 		p.parseCurrentToken()
 	}
 	return nil
@@ -2341,6 +2412,17 @@ type ParseOption func(p *parser)
 func ParseOptionEnableScripting(enable bool) ParseOption {
 	return func(p *parser) {
 		p.scripting = enable
+	}
+}
+
+// ParseOptionCustomElements gives a list of non-standard elements that should
+// be handled by the parser.
+//
+// This list replaces any previously given list. By default, non-standard
+// elements are processed according to the spec.
+func ParseOptionCustomElements(elements []CustomElement) ParseOption {
+	return func(p *parser) {
+		p.customElements = elements
 	}
 }
 

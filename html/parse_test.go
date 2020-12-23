@@ -454,6 +454,52 @@ func TestParseFragmentWithNilContext(t *testing.T) {
 	ParseFragment(strings.NewReader("<p>hello</p>"), nil)
 }
 
+func TestParseWithCustomElements(t *testing.T) {
+	customElements := []CustomElement{
+		{
+			Name: "x:ann", DisableFosterParenting: true, ProcessLike: 0,
+		}, {
+			Name: "x:tmpl", DisableFosterParenting: false, ProcessLike: atom.Template,
+		},
+	}
+	text := `<!doctype html><html><head></head><body>
+<x:tmpl><tr><td>foo</td></tr></x:tmpl>
+<p>lorem ipsum</p>
+<table>
+  <x:ann>annotation</x:ann>
+</table>
+</body></html>`
+	want := `| <!DOCTYPE html>
+| <html>
+|   <head>
+|   <body>
+|     "
+"
+|     <x:tmpl>
+|       <tr>
+|         <td>
+|           "foo"
+|     "
+"
+|     <p>
+|       "lorem ipsum"
+|     "
+"
+|     <table>
+|       "
+  "
+|       <x:ann>
+|         "annotation"
+|       "
+"
+|     "
+"
+`
+	if err := testParseCase(text, want, "", ParseOptionCustomElements(customElements)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func BenchmarkParser(b *testing.B) {
 	buf, err := ioutil.ReadFile("testdata/go1.html")
 	if err != nil {

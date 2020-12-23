@@ -179,16 +179,6 @@ func (s *nodeStack) index(n *Node) int {
 	return -1
 }
 
-// contains returns whether a is within s.
-func (s *nodeStack) contains(a atom.Atom) bool {
-	for _, n := range *s {
-		if n.DataAtom == a && n.Namespace == "" {
-			return true
-		}
-	}
-	return false
-}
-
 // insert inserts a node at the given index.
 func (s *nodeStack) insert(i int, n *Node) {
 	(*s) = append(*s, nil)
