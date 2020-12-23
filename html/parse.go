@@ -2363,13 +2363,11 @@ OUTER:
 					if elm.Name == p.tok.Data {
 						p.disableFosterParenting = elm.DisableFosterParenting
 						p.elm = elm.ProcessLike
-						fmt.Printf("custom element: <%v>, treat as <%v>\n", p.tok.Data, p.elm.String())
 						p.parseCurrentToken()
 						p.disableFosterParenting = false
 						continue OUTER
 					}
 				}
-				fmt.Printf("Unknown token: <%s>\n", p.tok.Data)
 			}
 		}
 		p.elm = p.tok.DataAtom
