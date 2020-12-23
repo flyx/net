@@ -10,7 +10,7 @@ import (
 	"io"
 	"strings"
 
-	a "golang.org/x/net/html/atom"
+	a "github.com/flyx/net/html/atom"
 )
 
 // CustomElement describes an element not defined by the HTML standard.
